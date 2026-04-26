@@ -11,17 +11,17 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.utils.tensorboard as tb
 
 from .datasets.road_dataset import load_data
 from .metrics import PlannerMetric
-from .models import MODEL_FACTORY, load_model, save_model
+from .models import MODEL_FACTORY, save_model
 
 
 def train(
     exp_dir: str = "logs",
     model_name: str = "mlp_planner",
+    transform_pipeline: str | None = None,
     num_epoch: int = 40,
     lr: float = 1e-3,
     batch_size: int = 64,
@@ -30,6 +30,7 @@ def train(
     seed: int = 2024,
     train_data: str = "drive_data/train",
     val_data: str = "drive_data/val",
+    **kwargs,
 ):
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -46,7 +47,8 @@ def train(
     log_dir.mkdir(parents=True, exist_ok=True)
     logger = tb.SummaryWriter(log_dir)
 
-    transform_pipeline = "default" if model_name == "cnn_planner" else "state_only"
+    if transform_pipeline is None:
+        transform_pipeline = "default" if model_name == "cnn_planner" else "state_only"
 
     train_loader = load_data(
         train_data,
@@ -151,6 +153,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp_dir", type=str, default="logs")
     parser.add_argument("--model_name", type=str, default="mlp_planner", choices=list(MODEL_FACTORY.keys()))
+    parser.add_argument("--transform_pipeline", type=str, default=None)
     parser.add_argument("--num_epoch", type=int, default=40)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=64)
