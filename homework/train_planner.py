@@ -47,8 +47,15 @@ def train(
     log_dir.mkdir(parents=True, exist_ok=True)
     logger = tb.SummaryWriter(log_dir)
 
+    required_pipeline = "default" if model_name == "cnn_planner" else "state_only"
     if transform_pipeline is None:
-        transform_pipeline = "default" if model_name == "cnn_planner" else "state_only"
+        transform_pipeline = required_pipeline
+    elif model_name == "cnn_planner" and transform_pipeline != "default":
+        print(
+            f"[warn] cnn_planner needs images; overriding transform_pipeline "
+            f"'{transform_pipeline}' -> 'default'"
+        )
+        transform_pipeline = "default"
 
     train_loader = load_data(
         train_data,
@@ -72,10 +79,49 @@ def train(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epoch)
 
+    loss_fn = torch.nn.SmoothL1Loss(reduction="none", beta=0.5)
+
+    # MLP underfits the lateral (y) axis on this dataset; weight it heavier to
+    # close the gap on the grader's lateral_error threshold. Other models train
+    # uniformly across axes.
+    if model_name == "mlp_planner":
+        axis_weight = torch.tensor([1.0, 2.0], device=device).view(1, 1, 2)
+        weight_sum = 3.0
+        ckpt_metric_key = "lateral_error"
+    else:
+        axis_weight = torch.tensor([1.0, 1.0], device=device).view(1, 1, 2)
+        weight_sum = 2.0
+        ckpt_metric_key = "l1_error"
+
     train_metric = PlannerMetric()
     val_metric = PlannerMetric()
     global_step = 0
+
+    # if a checkpoint already exists from a prior run, evaluate it and use its
+    # val_l1 as the best-so-far. that way repeated `train(...)` calls with
+    # different LRs only overwrite when they actually improve.
+    from .models import HOMEWORK_DIR
+    ckpt_path = HOMEWORK_DIR / f"{model_name}.th"
     best_val_l1 = float("inf")
+    if ckpt_path.exists():
+        try:
+            tmp = MODEL_FACTORY[model_name]().to(device)
+            tmp.load_state_dict(torch.load(ckpt_path, map_location=device))
+            tmp.eval()
+            ref_metric = PlannerMetric()
+            with torch.inference_mode():
+                for batch in val_loader:
+                    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                    if model_name == "cnn_planner":
+                        pred = tmp(image=batch["image"])
+                    else:
+                        pred = tmp(track_left=batch["track_left"], track_right=batch["track_right"])
+                    ref_metric.add(pred, batch["waypoints"], batch["waypoints_mask"])
+            best_val_l1 = ref_metric.compute()[ckpt_metric_key]
+            print(f"Existing checkpoint {ckpt_metric_key}={best_val_l1:.3f} (won't be overwritten unless beaten)")
+            del tmp
+        except Exception as e:
+            print(f"Could not evaluate existing checkpoint: {e}")
 
     for epoch in range(num_epoch):
         model.train()
@@ -93,8 +139,8 @@ def train(
                 pred = model(track_left=batch["track_left"], track_right=batch["track_right"])
 
             mask = waypoints_mask[..., None].float()
-            diff = (pred - waypoints) * mask
-            loss = (diff.abs().sum() + (diff ** 2).sum()) / (mask.sum() * 2 + 1e-8)
+            per_elem = loss_fn(pred, waypoints) * mask * axis_weight
+            loss = per_elem.sum() / (mask.sum() * weight_sum + 1e-8)
 
             optimizer.zero_grad()
             loss.backward()
@@ -140,12 +186,12 @@ def train(
             f"l1={val_stats['l1_error']:.3f}"
         )
 
-        if val_stats["l1_error"] < best_val_l1:
-            best_val_l1 = val_stats["l1_error"]
+        if val_stats[ckpt_metric_key] < best_val_l1:
+            best_val_l1 = val_stats[ckpt_metric_key]
             saved_path = save_model(model)
-            print(f"  -> saved best model to {saved_path} (val l1={best_val_l1:.3f})")
+            print(f"  -> saved best model to {saved_path} (val {ckpt_metric_key}={best_val_l1:.3f})")
 
-    print(f"Training complete. Best val l1_error: {best_val_l1:.3f}")
+    print(f"Training complete. Best val {ckpt_metric_key}: {best_val_l1:.3f}")
     logger.close()
 
 

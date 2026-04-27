@@ -13,7 +13,8 @@ class MLPPlanner(nn.Module):
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
-        hidden_dim: int = 128,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
     ):
         """
         Args:
@@ -25,18 +26,33 @@ class MLPPlanner(nn.Module):
         self.n_track = n_track
         self.n_waypoints = n_waypoints
 
-        in_dim = n_track * 2 * 2  # left + right, each (n_track, 2)
+        # uniformly spaced indices on the centerline used as residual references
+        ref_idx = torch.linspace(0, n_track - 1, n_waypoints + 2)[1:-1].round().long()
+        self.register_buffer("ref_idx", ref_idx, persistent=False)
+
+        # input: left + right + centerline points (each n_track x 2)
+        in_dim = n_track * 2 * 3
         out_dim = n_waypoints * 2
 
+        def block(in_c, out_c):
+            return nn.Sequential(
+                nn.Linear(in_c, out_c),
+                nn.LayerNorm(out_c),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+
         self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            block(in_dim, hidden_dim),
+            block(hidden_dim, hidden_dim),
+            block(hidden_dim, hidden_dim),
+            block(hidden_dim, hidden_dim),
             nn.Linear(hidden_dim, out_dim),
         )
+
+        # zero-init final layer so the network starts by predicting the centerline references exactly
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(
         self,
@@ -58,9 +74,12 @@ class MLPPlanner(nn.Module):
             torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
         """
         b = track_left.shape[0]
-        x = torch.cat([track_left, track_right], dim=1).reshape(b, -1)
-        out = self.mlp(x)
-        return out.reshape(b, self.n_waypoints, 2)
+        center = 0.5 * (track_left + track_right)
+        refs = center[:, self.ref_idx, :]  # (b, n_waypoints, 2) residual reference
+
+        x = torch.cat([track_left, track_right, center], dim=1).reshape(b, -1)
+        delta = self.mlp(x).reshape(b, self.n_waypoints, 2)
+        return refs + delta
 
 
 class TransformerPlanner(nn.Module):
